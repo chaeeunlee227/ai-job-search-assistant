@@ -69,10 +69,73 @@ function fetchWithTimeout(url: string, headers: Record<string, string>): Promise
 }
 
 /**
+ * Workday job page URLs, for example
+ * `https://td.wd3.myworkdayjobs.com/TD_Bank_Careers/job/Toronto-Ontario/Associate-Software-Engineer_R_1486593`
+ * or the same with a locale prefix (`/en-US/TD_Bank_Careers/job/...`).
+ */
+const WORKDAY_JOB_URL =
+  /^https?:\/\/([a-z0-9-]+)\.(wd\d+)\.myworkdayjobs\.com\/(?:[a-z]{2}-[A-Z]{2}\/)?([^/?#]+)\/job\/([^?#]+)/i;
+
+/**
+ * Reads a Workday posting through Workday's own JSON endpoint.
+ *
+ * Workday career sites are JavaScript apps: the HTML is an empty shell and the
+ * posting is loaded afterward from `/wday/cxs/<tenant>/<site>/job/<path>`, an
+ * endpoint that answers without authentication. Reader services get the empty
+ * shell, so this goes to the source. The description arrives as HTML and is
+ * flattened; the structured fields are written as a header so the extractor
+ * sees the title, location, and date even when the description omits them.
+ *
+ * @returns The posting as text, or null when the URL is not a Workday job page.
+ */
+async function fetchWorkdayPosting(url: string): Promise<string | null> {
+  const match = url.match(WORKDAY_JOB_URL);
+  if (!match) return null;
+  const [, tenant, region, site, path] = match;
+
+  const endpoint = `https://${tenant}.${region}.myworkdayjobs.com/wday/cxs/${tenant}/${site}/job/${path}`;
+  debug(`Workday posting detected; reading ${endpoint}`);
+
+  const response = await withRetry(
+    () => fetchWithTimeout(endpoint, { Accept: "application/json" }),
+    "workday",
+    2,
+  );
+  if (!response.ok) throw new Error(`HTTP ${response.status} from Workday`);
+
+  const body = (await response.json()) as {
+    jobPostingInfo?: Record<string, unknown> & { jobDescription?: string };
+  };
+  const job = body.jobPostingInfo;
+  if (!job?.jobDescription) throw new Error("Workday response had no job description");
+
+  const text = (value: unknown): string | null =>
+    typeof value === "string" && value.trim() ? value.trim() : null;
+  const header = [
+    ["Title", text(job.title)],
+    ["Location", text(job.location)],
+    ["Work site", text((job.jobRequisitionLocation as { descriptor?: unknown })?.descriptor)],
+    ["Remote type", text(job.remoteType)],
+    ["Time type", text(job.timeType)],
+    ["Requisition", text(job.jobReqId)],
+    ["Posted", text(job.postedOn)],
+    ["Posting date", text(job.startDate)],
+    ["Apply by", text(job.jobPostingEndDateAsText)],
+  ]
+    .filter(([, value]) => value)
+    .map(([label, value]) => `${label}: ${value}`)
+    .join("\n");
+
+  return `${header}\n\n${htmlToText(job.jobDescription)}`;
+}
+
+/**
  * Fetches a page and returns its readable text.
  *
- * The Jina Reader service is tried first because it renders JavaScript and
- * returns clean Markdown, which matters for job boards that build the posting
+ * Job boards with a known public data endpoint (currently Workday) are read
+ * from that endpoint, since their HTML carries no content. Otherwise the Jina
+ * Reader service is tried first because it renders JavaScript and returns
+ * clean Markdown, which matters for job boards that build the posting
  * client-side. When it fails, the page is fetched directly and stripped of
  * markup, so a plain server-rendered posting still works without the service.
  *
@@ -85,6 +148,9 @@ export async function fetchPageText(
   url: string,
   maxChars: number = LIMITS.maxUrlChars,
 ): Promise<string> {
+  const workday = await fetchWorkdayPosting(url);
+  if (workday) return workday.slice(0, maxChars);
+
   let text = "";
   let readerFailure: string | null = null;
 
