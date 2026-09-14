@@ -1,0 +1,10 @@
+# Secrets
+.env
+
+# Everything derived from your own postings and resume stays local.
+input/
+data/
+reports/
+
+node_modules/
+.DS_Store
